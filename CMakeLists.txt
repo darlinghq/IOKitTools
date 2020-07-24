@@ -5,8 +5,8 @@ add_darling_executable(ioclasscount ioclasscount.tproj/ioclasscount.c)
 add_darling_executable(ioalloccount ioalloccount.tproj/ioalloccount.c)
 
 target_link_libraries(ioreg IOKit CoreFoundation ncurses)
-target_link_libraries(ioclasscount IOKit CoreFoundation)
-target_link_libraries(ioalloccount IOKit CoreFoundation)
+target_link_libraries(ioclasscount IOKit CoreFoundation CoreSymbolication)
+target_link_libraries(ioalloccount IOKit CoreFoundation CoreSymbolication)
 
 install(TARGETS
 	ioreg
