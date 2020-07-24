@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2011 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2000-2013 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -25,13 +25,15 @@
 #include <IOKit/IOCFSerialize.h>                      // (IOCFSerialize, ...)
 #include <IOKit/IOKitLib.h>                           // (IOMasterPort, ...)
 #include <IOKit/IOKitLibPrivate.h>                    // (IOServiceGetState, ...)
+#include <IOKit/IOKitKeysPrivate.h>                   // (kIOClassNameOverrideNone, ...)
 #include <sys/ioctl.h>                                // (TIOCGWINSZ, ...)
 #include <term.h>                                     // (tputs, ...)
 #include <unistd.h>                                   // (getopt, ...)
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-#define assertion(e, message) ((void) (__builtin_expect(!(e), 0) ? fprintf(stderr, "ioreg: error: %s.\n", message), exit(1) : 0))
+#define assertion_fatal(e, message) ((void) (__builtin_expect(!(e), 0) ? fprintf(stderr, "ioreg: error: %s.\n", message), exit(1) : 0))
+#define assertion(e, message, fail) ((void) (__builtin_expect(!(e), 0) ? fprintf(stderr, "ioreg: error: %s.\n", message), (fail) : 0))
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
@@ -249,7 +251,7 @@ int main(int argc, char ** argv)
     // Obtain the I/O Kit root service.
 
     service = IORegistryGetRootEntry(kIOMasterPortDefault);
-    assertion(service, "can't obtain I/O Kit's root service");
+    assertion_fatal(service, "can't obtain I/O Kit's root service");
 
     // Traverse over all the I/O Kit services.
 
@@ -272,23 +274,26 @@ int main(int argc, char ** argv)
 
         if (object)
         {
+            CFErrorRef err;
+
             path = CFURLCreateWithFileSystemPath( /* allocator   */ kCFAllocatorDefault,
                                                   /* filePath    */ CFSTR("/dev/stdout"),
                                                   /* pathStyle   */ kCFURLPOSIXPathStyle,
                                                   /* isDirectory */ FALSE );
-            assertion(path != NULL, "can't create path");
+            assertion_fatal(path != NULL, "can't create path");
 
             file = CFWriteStreamCreateWithFile(kCFAllocatorDefault, path);
-            assertion(file != NULL, "can't create file");
+            assertion_fatal(file != NULL, "can't create file");
 
             success = CFWriteStreamOpen(file);
-            assertion(success, "can't open file");
+            assertion_fatal(success, "can't open file");
 
-            CFPropertyListWrite( /* propertyList */ object,
+            err = CFPropertyListWrite( /* propertyList */ object,
                                  /* stream       */ file,
                                  /* format       */ kCFPropertyListXMLFormat_v1_0,
                                  /* options      */ 0,
-                                 /* error        */ NULL );
+                                 /* error        */ &err );
+            assertion_fatal(err != 0, "CFPropertyListWrite(): error");
 
             CFWriteStreamClose(file);
 
@@ -346,30 +351,68 @@ static CFMutableDictionaryRef archive( io_registry_entry_t service,
 
     if (options.list || compare(service, options))
     {
-        // Obtain the service's properties.
+        Size        keycount;
+        CFTypeRef   *keys_refs;
+        CFTypeRef   *values_refs;
+        int         i;
 
+        // Obtain the service's properties.
         status = IORegistryEntryCreateCFProperties( service,
                                                     &dictionary,
                                                     kCFAllocatorDefault,
                                                     kNilOptions );
-        assertion(status == KERN_SUCCESS, "can't obtain properties");
+        assertion(status == KERN_SUCCESS, "can't obtain properties", dictionary = NULL);
+
+        /*
+         * CF does not support OSSet in plists, so replace any occurrences in the plist we've received
+         * with an OSArray containing the same data.
+         */
+        keycount = CFDictionaryGetCount(dictionary);
+        keys_refs = (CFTypeRef *) malloc(keycount * sizeof(CFTypeRef));
+        values_refs = (CFTypeRef *) malloc(keycount * sizeof(CFTypeRef));
+
+        CFDictionaryGetKeysAndValues(dictionary, (const void **) keys_refs, (const void **) values_refs);
+        const void **keys = (const void **) keys_refs;
+        const void **values = (const void **) values_refs;
+
+        for (i = 0; i < keycount; i++) {
+            if (CFGetTypeID(values[i]) == CFSetGetTypeID()) {
+                CFIndex set_length;
+                CFArrayRef replacement_array = 0;
+                CFTypeRef *set_values;
+
+                set_length = CFSetGetCount(values[i]);
+                set_values = (CFTypeRef *)malloc(set_length * sizeof(CFTypeRef));
+
+                CFSetGetValues(values_refs[i], set_values);
+                replacement_array = CFArrayCreate(kCFAllocatorDefault, (const void **)set_values, set_length, &kCFTypeArrayCallBacks);
+                assertion_fatal(replacement_array != NULL, "can't create array for set replacement");
+
+                CFDictionaryReplaceValue(dictionary, keys[i], replacement_array);
+
+                CFRelease(replacement_array);
+                free(set_values);
+            }
+        }
+        free(keys_refs);
+        free(values_refs);
     }
-    else
+    if (!dictionary)
     {
         dictionary = CFDictionaryCreateMutable( kCFAllocatorDefault,
                                                 0,
                                                 &kCFTypeDictionaryKeyCallBacks,
                                                 &kCFTypeDictionaryValueCallBacks );
-        assertion(dictionary != NULL, "can't create dictionary");
+        assertion_fatal(dictionary != NULL, "can't create dictionary");
     }
 
     // Obtain the name of the service.
 
     status = IORegistryEntryGetNameInPlane(service, options.plane, name);
-    assertion(status == KERN_SUCCESS, "can't obtain name");
+    assertion(status == KERN_SUCCESS, "can't obtain name", strcpy(name, "<name error>"));
 
     object = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingUTF8);
-    assertion(object != NULL, "can't create name");
+    assertion_fatal(object != NULL, "can't create name");
 
     CFDictionarySetValue(dictionary, CFSTR("IORegistryEntryName"), object);
     CFRelease(object);
@@ -380,7 +423,7 @@ static CFMutableDictionaryRef archive( io_registry_entry_t service,
     if (status == KERN_SUCCESS)
     {
         object = CFStringCreateWithCString(kCFAllocatorDefault, location, kCFStringEncodingUTF8);
-        assertion(object != NULL, "can't create location");
+        assertion_fatal(object != NULL, "can't create location");
 
         CFDictionarySetValue(dictionary, CFSTR("IORegistryEntryLocation"), object);
         CFRelease(object);
@@ -389,21 +432,21 @@ static CFMutableDictionaryRef archive( io_registry_entry_t service,
     // Obtain the ID of the service.
 
     status = IORegistryEntryGetRegistryEntryID(service, &identifier);
-    assertion(status == KERN_SUCCESS, "can't obtain identifier");
+    assertion(status == KERN_SUCCESS, "can't obtain identifier", identifier = UINT64_MAX);
 
     object = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &identifier);
-    assertion(object != NULL, "can't create identifier");
+    assertion_fatal(object != NULL, "can't create identifier");
 
     CFDictionarySetValue(dictionary, CFSTR("IORegistryEntryID"), object);
     CFRelease(object);
 
     // Obtain the class of the service.
 
-    status = IOObjectGetClass(service, class);
-    assertion(status == KERN_SUCCESS, "can't obtain class");
+    status = _IOObjectGetClass(service, kIOClassNameOverrideNone, class);
+    assertion(status == KERN_SUCCESS, "can't obtain class", strcpy(class, "<class error>"));
 
-    object = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingUTF8);
-    assertion(object != NULL, "can't create class");
+    object = CFStringCreateWithCString(kCFAllocatorDefault, class, kCFStringEncodingUTF8);
+    assertion_fatal(object != NULL, "can't create class");
 
     CFDictionarySetValue(dictionary, CFSTR("IOObjectClass"), object);
     CFRelease(object);
@@ -413,32 +456,32 @@ static CFMutableDictionaryRef archive( io_registry_entry_t service,
     count = IOObjectGetKernelRetainCount(service);
 
     object = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &count);
-    assertion(object != NULL, "can't create retain count");
+    assertion_fatal(object != NULL, "can't create retain count");
 
     CFDictionarySetValue(dictionary, CFSTR("IOObjectRetainCount"), object);
     CFRelease(object);
 
     // Obtain the busy state of the service (for IOService objects).
 
-    if (IOObjectConformsTo(service, "IOService"))
+    if (_IOObjectConformsTo(service, "IOService", kIOClassNameOverrideNone))
     {
         status = IOServiceGetBusyStateAndTime(service, &state, &count, &time);
-        assertion(status == KERN_SUCCESS, "can't obtain state");
+        assertion(status == KERN_SUCCESS, "can't obtain state", time = state = count = 0);
 
         object = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &state);
-        assertion(object != NULL, "can't create state");
+        assertion_fatal(object != NULL, "can't create state");
 
         CFDictionarySetValue(dictionary, CFSTR("IOServiceState"), object);
         CFRelease(object);
 
         object = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &count);
-        assertion(object != NULL, "can't create busy state");
+        assertion_fatal(object != NULL, "can't create busy state");
 
         CFDictionarySetValue(dictionary, CFSTR("IOServiceBusyState"), object);
         CFRelease(object);
 
         object = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &time);
-        assertion(object != NULL, "can't create busy time");
+        assertion_fatal(object != NULL, "can't create busy time");
 
         CFDictionarySetValue(dictionary, CFSTR("IOServiceBusyTime"), object);
         CFRelease(object);
@@ -464,45 +507,46 @@ static CFMutableDictionaryRef archive_scan( io_registry_entry_t service,
     // Obtain the service's children.
 
     status = IORegistryEntryGetChildIterator(service, options.plane, &children);
-    assertion(status == KERN_SUCCESS, "can't obtain children");
-
-    childUpNext = IOIteratorNext(children);
-
-    // Obtain the relevant service information.
-
-    dictionary = archive(service, options);
-
-    // Traverse over the children of this service.
-
-    if (options.depth == 0 || options.depth > serviceDepth + 1)
+    if (status == KERN_SUCCESS)
     {
-        if (childUpNext)
+        childUpNext = IOIteratorNext(children);
+
+        // Obtain the relevant service information.
+
+        dictionary = archive(service, options);
+
+        // Traverse over the children of this service.
+
+        if (options.depth == 0 || options.depth > serviceDepth + 1)
         {
-            array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-            assertion(array != NULL, "can't create array");
-
-            while (childUpNext)
+            if (childUpNext)
             {
-                child       = childUpNext;
-                childUpNext = IOIteratorNext(children);
+                array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+                assertion_fatal(array != NULL, "can't create array");
 
-                object = archive_scan( /* service      */ child,
-                                       /* serviceDepth */ serviceDepth + 1,
-                                       /* options      */ options );
-                assertion(object != NULL, "can't obtain child");
+                while (childUpNext)
+                {
+                    child       = childUpNext;
+                    childUpNext = IOIteratorNext(children);
 
-                CFArrayAppendValue(array, object);
-                CFRelease(object);
+                    object = archive_scan( /* service      */ child,
+                                           /* serviceDepth */ serviceDepth + 1,
+                                           /* options      */ options );
+                    assertion_fatal(object != NULL, "can't obtain child");
 
-                IOObjectRelease(child);
+                    CFArrayAppendValue(array, object);
+                    CFRelease(object);
+
+                    IOObjectRelease(child);
+                }
+
+                CFDictionarySetValue(dictionary, CFSTR("IORegistryEntryChildren"), array);
+                CFRelease(array);
             }
-
-            CFDictionarySetValue(dictionary, CFSTR("IORegistryEntryChildren"), array);
-            CFRelease(array);
         }
-    }
 
-    IOObjectRelease(children);
+        IOObjectRelease(children);
+    }
 
     return dictionary;
 }
@@ -551,7 +595,7 @@ static CFMutableArrayRef archive_search( io_registry_entry_t service,
             for (index = serviceDepth; index > 0; index--)
             {
                 dictionary2 = archive(stackOfObjects[index - 1], options);
-                assertion(dictionary2 != NULL, "can't obtain parent");
+                assertion_fatal(dictionary2 != NULL, "can't obtain parent");
 
                 CFDictionarySetValue(dictionary2, CFSTR("IORegistryEntryChildren"), dictionary);
                 CFRelease(dictionary);
@@ -567,7 +611,7 @@ static CFMutableArrayRef archive_search( io_registry_entry_t service,
         }
 
         array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        assertion(array != NULL, "can't create array");
+        assertion_fatal(array != NULL, "can't create array");
 
         CFArrayAppendValue(array, dictionary);
         CFRelease(dictionary);
@@ -580,39 +624,40 @@ static CFMutableArrayRef archive_search( io_registry_entry_t service,
     // Obtain the service's children.
 
     status = IORegistryEntryGetChildIterator(service, options.plane, &children);
-    assertion(status == KERN_SUCCESS, "can't obtain children");
-
-    childUpNext = IOIteratorNext(children);
-
-    // Traverse over the children of this service.
-
-    while (childUpNext)
+    if (status == KERN_SUCCESS)
     {
-        child       = childUpNext;
         childUpNext = IOIteratorNext(children);
 
-        array2 = archive_search( /* service                */ child,
-                                 /* serviceHasMatchedDepth */ serviceHasMatchedDepth,
-                                 /* serviceDepth           */ serviceDepth + 1,
-                                 /* stackOfObjects         */ stackOfObjects,
-                                 /* options                */ options );
-        if (array2)
+        // Traverse over the children of this service.
+
+        while (childUpNext)
         {
-            if (array)
+            child       = childUpNext;
+            childUpNext = IOIteratorNext(children);
+
+            array2 = archive_search( /* service                */ child,
+                                     /* serviceHasMatchedDepth */ serviceHasMatchedDepth,
+                                     /* serviceDepth           */ serviceDepth + 1,
+                                     /* stackOfObjects         */ stackOfObjects,
+                                     /* options                */ options );
+            if (array2)
             {
-                CFArrayAppendArray(array, array2, CFRangeMake(0, CFArrayGetCount(array2)));
-                CFRelease(array2);
+                if (array)
+                {
+                    CFArrayAppendArray(array, array2, CFRangeMake(0, CFArrayGetCount(array2)));
+                    CFRelease(array2);
+                }
+                else
+                {
+                    array = array2;
+                }
             }
-            else
-            {
-                array = array2;
-            }
+
+            IOObjectRelease(child);
         }
 
-        IOObjectRelease(child);
+        IOObjectRelease(children);
     }
-
-    IOObjectRelease(children);
 
     return array;
 }
@@ -633,7 +678,7 @@ static Boolean compare( io_registry_entry_t service,
 
     if (options.class)
     {
-        if (IOObjectConformsTo(service, options.class) == FALSE)
+        if (_IOObjectConformsTo(service, options.class, kIOClassNameOverrideNone) == FALSE)
         {
             return FALSE;
         }
@@ -648,7 +693,7 @@ static Boolean compare( io_registry_entry_t service,
         key = CFStringCreateWithCString( kCFAllocatorDefault,
                                          options.key,
                                          kCFStringEncodingUTF8 );
-        assertion(key != NULL, "can't create key");
+        assertion_fatal(key != NULL, "can't create key");
 
         value = IORegistryEntryCreateCFProperty( service,
                                                  key,
@@ -674,7 +719,7 @@ static Boolean compare( io_registry_entry_t service,
         // Obtain the name of the service.
 
         status = IORegistryEntryGetNameInPlane(service, options.plane, name);
-        assertion(status == KERN_SUCCESS, "can't obtain name");
+        assertion(status == KERN_SUCCESS, "can't obtain name", strcpy(name, "<name error>"));
 
         if (strchr(options.name, '@'))
         {
@@ -713,51 +758,52 @@ static void scan( io_registry_entry_t service,
     // Obtain the service's children.
 
     status = IORegistryEntryGetChildIterator(service, options.plane, &children);
-    assertion(status == KERN_SUCCESS, "can't obtain children");
-
-    childUpNext = IOIteratorNext(children);
-
-    // Save has-more-siblings state into stackOfBits for this depth.
-
-    if (serviceHasMoreSiblings)
-        stackOfBits |=  (1 << serviceDepth);
-    else
-        stackOfBits &= ~(1 << serviceDepth);
-
-    // Save has-children state into stackOfBits for this depth.
-
-    if (options.depth == 0 || options.depth > serviceDepth + 1)
+    if (status == KERN_SUCCESS)
     {
-        if (childUpNext)
-            stackOfBits |=  (2 << serviceDepth);
+        childUpNext = IOIteratorNext(children);
+
+        // Save has-more-siblings state into stackOfBits for this depth.
+
+        if (serviceHasMoreSiblings)
+            stackOfBits |=  (1 << serviceDepth);
         else
-            stackOfBits &= ~(2 << serviceDepth);
-    }
+            stackOfBits &= ~(1 << serviceDepth);
 
-    // Print out the relevant service information.
+        // Save has-children state into stackOfBits for this depth.
 
-    show(service, serviceDepth, stackOfBits, options);
-
-    // Traverse over the children of this service.
-
-    if (options.depth == 0 || options.depth > serviceDepth + 1)
-    {
-        while (childUpNext)
+        if (options.depth == 0 || options.depth > serviceDepth + 1)
         {
-            child       = childUpNext;
-            childUpNext = IOIteratorNext(children);
-
-            scan( /* service                */ child,
-                  /* serviceHasMoreSiblings */ (childUpNext) ? TRUE : FALSE,
-                  /* serviceDepth           */ serviceDepth + 1,
-                  /* stackOfBits            */ stackOfBits,
-                  /* options                */ options );
-
-            IOObjectRelease(child);
+            if (childUpNext)
+                stackOfBits |=  (2 << serviceDepth);
+            else
+                stackOfBits &= ~(2 << serviceDepth);
         }
-    }
 
-    IOObjectRelease(children);
+        // Print out the relevant service information.
+
+        show(service, serviceDepth, stackOfBits, options);
+
+        // Traverse over the children of this service.
+
+        if (options.depth == 0 || options.depth > serviceDepth + 1)
+        {
+            while (childUpNext)
+            {
+                child       = childUpNext;
+                childUpNext = IOIteratorNext(children);
+
+                scan( /* service                */ child,
+                      /* serviceHasMoreSiblings */ (childUpNext) ? TRUE : FALSE,
+                      /* serviceDepth           */ serviceDepth + 1,
+                      /* stackOfBits            */ stackOfBits,
+                      /* options                */ options );
+
+                IOObjectRelease(child);
+            }
+        }
+
+        IOObjectRelease(children);
+    }
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -823,27 +869,28 @@ static void search( io_registry_entry_t service,
     // Obtain the service's children.
 
     status = IORegistryEntryGetChildIterator(service, options.plane, &children);
-    assertion(status == KERN_SUCCESS, "can't obtain children");
-
-    childUpNext = IOIteratorNext(children);
-
-    // Traverse over the children of this service.
-
-    while (childUpNext)
+    if (status == KERN_SUCCESS)
     {
-        child       = childUpNext;
         childUpNext = IOIteratorNext(children);
 
-        search( /* service                */ child,
-                /* serviceHasMatchedDepth */ serviceHasMatchedDepth,
-                /* serviceDepth           */ serviceDepth + 1,
-                /* stackOfObjects         */ stackOfObjects,
-                /* options                */ options );
+        // Traverse over the children of this service.
 
-        IOObjectRelease(child);
+        while (childUpNext)
+        {
+            child       = childUpNext;
+            childUpNext = IOIteratorNext(children);
+
+            search( /* service                */ child,
+                    /* serviceHasMatchedDepth */ serviceHasMatchedDepth,
+                    /* serviceDepth           */ serviceDepth + 1,
+                    /* stackOfObjects         */ stackOfObjects,
+                    /* options                */ options );
+
+            IOObjectRelease(child);
+        }
+
+        IOObjectRelease(children);
     }
-
-    IOObjectRelease(children);
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -866,7 +913,7 @@ static void show( io_registry_entry_t service,
     // Print out the name of the service.
 
     status = IORegistryEntryGetNameInPlane(service, options.plane, name);
-    assertion(status == KERN_SUCCESS, "can't obtain name");
+    assertion(status == KERN_SUCCESS, "can't obtain name", strcpy(name, "<name error>"));
 
     indent(TRUE, serviceDepth, stackOfBits);
 
@@ -892,21 +939,23 @@ static void show( io_registry_entry_t service,
         char *      aCStr;
 
         classCFStr = IOObjectCopyClass (service);
-        ancestryCFStr = createInheritanceStringForIORegistryClassName (classCFStr);
-
-        aCStr = (char *) CFStringGetCStringPtr (ancestryCFStr, kCFStringEncodingMacRoman);
-        if (NULL != aCStr)
-        {
-            print(aCStr);
+        if (classCFStr) {
+            ancestryCFStr = createInheritanceStringForIORegistryClassName (classCFStr);
+            if (ancestryCFStr) {
+                aCStr = (char *) CFStringGetCStringPtr (ancestryCFStr, kCFStringEncodingMacRoman);
+                if (NULL != aCStr)
+                {
+                    print(aCStr);
+                }
+                CFRelease (ancestryCFStr);
+            }
+            CFRelease (classCFStr);
         }
-
-        CFRelease (classCFStr);
-        CFRelease (ancestryCFStr);
     }
     else
     {
-        status = IOObjectGetClass(service, class);
-        assertion(status == KERN_SUCCESS, "can't obtain class");
+        status = _IOObjectGetClass(service, kIOClassNameOverrideNone, class);
+        assertion(status == KERN_SUCCESS, "can't obtain class", strcpy(class, "<class error>"));
 
         print("%s", class);
     }
@@ -923,10 +972,10 @@ static void show( io_registry_entry_t service,
 
     // Print out the busy state of the service (for IOService objects).
 
-    if (IOObjectConformsTo(service, "IOService"))
+    if (_IOObjectConformsTo(service, "IOService", kIOClassNameOverrideNone))
     {
         status = IOServiceGetBusyStateAndTime(service, &state, &integer, &accumulated_busy_time);
-        assertion(status == KERN_SUCCESS, "can't obtain state");
+        assertion(status == KERN_SUCCESS, "can't obtain state", accumulated_busy_time = integer = state = 0);
 
         print( ", %sregistered, %smatched, %sactive",
                state & kIOServiceRegisteredState ? "" : "!",
@@ -964,7 +1013,16 @@ static void show( io_registry_entry_t service,
                                                     &properties,
                                                     kCFAllocatorDefault,
                                                     kNilOptions );
-        assertion(status == KERN_SUCCESS, "can't obtain properties");
+        assertion(status == KERN_SUCCESS, "can't obtain properties", properties = NULL);
+
+        if (!properties)
+        {
+            properties = CFDictionaryCreateMutable( kCFAllocatorDefault,
+                                                    0,
+                                                    &kCFTypeDictionaryKeyCallBacks,
+                                                    &kCFTypeDictionaryValueCallBacks );
+            assertion_fatal(properties != NULL, "can't create dictionary");
+        }
 
         // Print out the service's properties.
 
@@ -1047,7 +1105,7 @@ void usage()
      "\t-n list properties of objects with the given name\n"
      "\t-p traverse registry over the given plane (IOService is default)\n"
      "\t-r show subtrees rooted by the given criteria\n"
-     "\t-t show location of each substree\n"
+     "\t-t show location of each subtree\n"
      "\t-w clip output to the given line width (0 is unlimited)\n"
      "\t-x show data and numbers as hexadecimal\n"
      );
@@ -1079,7 +1137,7 @@ static void boldinit()
             termcapstr_boldon  = tgetstr("md", &termcapbufptr);
             termcapstr_boldoff = tgetstr("me", &termcapbufptr);
 
-            assertion(termcapbufptr - termcapbuf <= sizeof(termcapbuf), "can't obtain terminfo");
+            assertion_fatal(termcapbufptr - termcapbuf <= sizeof(termcapbuf), "can't obtain terminfo");
         }
     }
 
@@ -1112,7 +1170,7 @@ static void printinit(int width)
         printbufleft = width;
         printbufsize = width;
 
-        assertion(printbuf != NULL, "can't allocate buffer");
+        assertion_fatal(printbuf != NULL, "can't allocate buffer");
     }
 }
 
@@ -1394,31 +1452,35 @@ static void cfstringshow(CFStringRef object)
 
 static CFStringRef createInheritanceStringForIORegistryClassName(CFStringRef name)
 {
-	CFStringRef				curClassCFStr;
-	CFStringRef				oldClassCFStr;
-	CFMutableStringRef		outCFStr;
+	CFStringRef				curClassCFStr = NULL;
+	CFStringRef				oldClassCFStr = NULL;
+	CFMutableStringRef		outCFStr = NULL;
 	
 	outCFStr = CFStringCreateMutable (NULL, 512);
-	CFStringInsert (outCFStr, 0, name);
-	
-	curClassCFStr = CFStringCreateCopy (NULL, name);
-	
-	for (;;)
-	{
-		oldClassCFStr = curClassCFStr;
-		curClassCFStr = IOObjectCopySuperclassForClass (curClassCFStr);
-		CFRelease (oldClassCFStr);
-		
-		if (FALSE == CFEqual (curClassCFStr, CFSTR ("OSObject")))
-		{
-			CFStringInsert (outCFStr, 0, CFSTR (":"));
-			CFStringInsert (outCFStr, 0, curClassCFStr);
-		}
-		else
-		{
-			break;
-		}
-	}
+    if (outCFStr == NULL) return(NULL);
+    
+    CFStringInsert (outCFStr, 0, name);
+    
+    curClassCFStr = CFStringCreateCopy (NULL, name);
+    if (curClassCFStr == NULL) return((CFStringRef) outCFStr);
+
+    for (;;)
+    {
+        oldClassCFStr = curClassCFStr;
+        curClassCFStr = IOObjectCopySuperclassForClass (curClassCFStr);
+        CFRelease (oldClassCFStr);
+        if (curClassCFStr == NULL)  break;
+        
+        if (FALSE == CFEqual (curClassCFStr, CFSTR ("OSObject")))
+        {
+            CFStringInsert (outCFStr, 0, CFSTR (":"));
+            CFStringInsert (outCFStr, 0, curClassCFStr);
+        }
+        else
+        {
+            break;
+        }
+    } // for...
     
     if (curClassCFStr) CFRelease(curClassCFStr);
 	
@@ -1453,7 +1515,7 @@ static void printProp(CFStringRef key, CFTypeRef value, struct context * context
             status = IORegistryEntryGetNameInPlane( parentObj,
                                                     kIODeviceTreePlane,
                                                     parentName );
-            assertion(status == KERN_SUCCESS, "could not get name of parent");
+            assertion(status == KERN_SUCCESS, "could not get name of parent", strcpy(parentName, "<name error>"));
             
             IOObjectRelease(parentObj);
             
@@ -1573,11 +1635,12 @@ getRecursivePropValue( io_registry_entry_t thisRegEntry, CFStringRef propertyNam
                                           propertyNameToLookFor,
                                           kCFAllocatorDefault,
                                           kIORegistryIterateParents | kIORegistryIterateRecursively);
-    assertion( ptr != NULL, "unable to get properties" );
-
-	returnValue = *(SInt32 *)CFDataGetBytePtr( (CFDataRef) ptr );
-
-	CFRelease( ptr );
+    assertion( ptr != NULL, "unable to get properties", returnValue = 0 );
+    if (ptr)
+    {
+        returnValue = *(SInt32 *)CFDataGetBytePtr( (CFDataRef) ptr );
+        CFRelease( ptr );
+    }
 	return( returnValue );
 }
 
@@ -1600,7 +1663,7 @@ static void printPhysAddr(CFTypeRef value, struct context * context)
 
     // Ensure that the object passed in is in fact a CFData object.
 
-    assertion(CFGetTypeID(value) == CFDataGetTypeID(), "invalid phys addr");
+    assertion_fatal(CFGetTypeID(value) == CFDataGetTypeID(), "invalid phys addr");
 
     // Make sure there is actually data in the object.
     length = CFDataGetLength((CFDataRef)value);
@@ -1677,7 +1740,7 @@ static void printSlotNames(CFTypeRef value, struct context * context)
     
     // Ensure that the object passed in is in fact a CFData object.
 
-    assertion(CFGetTypeID(value) == CFDataGetTypeID(), "invalid phys addr");
+    assertion_fatal(CFGetTypeID(value) == CFDataGetTypeID(), "invalid phys addr");
 
     // Make sure there is actually data in the object.
     
@@ -1727,7 +1790,7 @@ static void printPCIRanges(CFTypeRef value, struct context * context)
     const char			   *titles[] = {"-child--", "-parent-", "-size---"};
     
     // Ensure that the object passed in is in fact a CFData object.
-    assertion(CFGetTypeID(value) == CFDataGetTypeID(), "invalid ranges");
+    assertion_fatal(CFGetTypeID(value) == CFDataGetTypeID(), "invalid ranges");
 
     // Make sure there is actually data in the object.
     length = CFDataGetLength((CFDataRef)value);
@@ -1742,7 +1805,7 @@ static void printPCIRanges(CFTypeRef value, struct context * context)
 
     // Get #address-cells of device-tree parent
     status = IORegistryEntryGetParentEntry( context->service, kIODeviceTreePlane, &parentObj );
-    assertion(status == KERN_SUCCESS, "unable to get device tree parent");
+    assertion(status == KERN_SUCCESS, "unable to get device tree parent", parentObj = MACH_PORT_NULL);
 
 	parentACells = getRecursivePropValue( parentObj, CFSTR( "#address-cells" ) );
 
@@ -1801,9 +1864,9 @@ static void makepath(io_registry_entry_t target, io_string_t path)
     kern_return_t status = KERN_SUCCESS;
     
     status = IORegistryEntryGetPath(target, kIODeviceTreePlane, path);
-    assertion(status == KERN_SUCCESS, "unable to get path");
+    assertion(status == KERN_SUCCESS, "unable to get path", strcpy(path, "<path error"));
 
-    strlcpy(path, strchr(path, ':') + 1, sizeof(io_string_t));
+    memmove(path, strchr(path, ':') + 1, strlen(strchr(path, ':') + 1) + 1);
 }
 
 static Boolean lookupPHandle(UInt32 phandle, io_registry_entry_t * device)
@@ -1877,7 +1940,7 @@ static void printInterruptMap(CFTypeRef value, struct context * context)
         println("");
 
         // Lookup the phandle and retreive needed info.
-        assertion( lookupPHandle(*position, &intParent), "error looking up phandle" );
+        assertion( lookupPHandle(*position, &intParent), "error looking up phandle", intParent = MACH_PORT_NULL );
 
 		parentCells = getRecursivePropValue( intParent, CFSTR( "#address-cells"   ) )
 					+ getRecursivePropValue( intParent, CFSTR( "#interrupt-cells" ) );
