@@ -1,5 +1,9 @@
 project(IOKitTools)
 
+add_compile_options(
+	-Wno-error=int-conversion
+)
+
 add_darling_executable(ioreg ioreg.tproj/ioreg.c)
 add_darling_executable(ioclasscount ioclasscount.tproj/ioclasscount.c)
 add_darling_executable(ioalloccount ioalloccount.tproj/ioalloccount.c)
